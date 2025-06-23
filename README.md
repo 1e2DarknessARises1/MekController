@@ -6,3 +6,6 @@ There is a turbine main summary panel that lets you controll and see the output 
 You can adjust the cell layout in the config, it will first launch when you start the program and you can config it inside the program by either touching the button on the monitor or clicking it on the terminal.
 I will be working on adding a pocket controller using a pocket computer that will communicate to the main terminal so you can remotely control this stuff as well.
 Also for the setup of the sps on/off controls, you need to link a redstone output to the back of the terminal to the connected energy pipe to your sps valve to turn on and off that pipe.
+
+
+Current Pastebin is JVQHZDvV
