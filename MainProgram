@@ -1,27 +1,31 @@
 --[[
-Mekanism Monitor for ComputerCraft (v83.00-Hybrid)
+Mekanism Monitor for ComputerCraft (v86.27-Fix)
 
-This version includes a major overhaul of the panel layout system for a clean, professional UI.
+This version restores the spacious, readable layouts for both reactors while guaranteeing the control buttons are always visible.
 
 Features:
-- Asymmetric Display: Terminal shows 1 large panel, Monitor shows the 4-panel grid.
-- Independent Paging: Terminal and Monitor have separate, independent page controls.
-- Synchronized Config Menu: The configuration menu is mirrored on both screens for setup.
+- Multi-Monitor Support: The script now detects and uses all connected monitors, with each monitor having independent page controls.
+- Asymmetric Display: Terminal shows a single large panel, while monitors can show a 4-panel grid.
+- Synchronized Config Menu: The configuration menu is mirrored on all screens for setup.
 - All device types are fully supported with detailed drawing functions.
 - Robust, non-compacted code for better stability and readability.
 
-FIXES (v83.00):
-- Reworked the dynamic layout system to correctly handle expanding panels.
-- Expanding Fusion Reactor panels no longer hide other panels; displaced items are correctly moved to the next available slot or page.
-- Restored the control buttons on the Fusion Reactor panel.
-- Inverted SPS redstone control logic to match user expectation (ON on screen = signal OFF).
-- Fixed visual glitch when paging by forcing a consistent layout when multiple devices are present.
+FIXES (v86.27):
+- Fixed a typo in the drawFusionReactorQuadrant function that was preventing the injection rate buttons from being drawn correctly.
+
+FIXES (v86.26):
+- Changed the siren from a sine wave to a square wave. This creates a much harsher, louder, and more noticeable alarm sound that should be audible from a greater distance.
+- Further increased the pitch of the alarm tones.
+
+FIXES (v86.25):
+- Increased the frequencies for the siren audio to make it much higher-pitched and more urgent.
 
 Setup:
 1. Place ComputerCraft computer adjacent to Mekanism devices.
-2. Place a Monitor peripheral next to the computer.
-3. Run the script. If it's your first time, the config menu will appear.
-4. To stop: Use the on-screen "END" button or press Ctrl+T.
+2. Place one or more Monitor peripherals next to the computer.
+3. (Optional) Place a Speaker peripheral next to the computer for audible alerts.
+4. Run the script. If it's your first time, the config menu will appear.
+5. To stop: Use the on-screen "END" button or press Ctrl+T.
 --]]
 
 -- =================================================================
@@ -39,14 +43,20 @@ local fusionReactorNamePrefix = "fusionReactorLogicAdapter"
 local inductionMatrixNamePrefix = "inductionPort"
 local boilerNamePrefix = "boilerValve"
 local thermalEvaporationNamePrefix = "thermalEvaporationValve"
+local fissionReactorNamePrefix = "fissionReactorLogicAdapter"
 local spsRedstoneControlSide = "back" -- Side for SPS redstone control. E.g., "left", "right", "top", etc.
-local displayRefreshDelay = 0.1
+local displayRefreshDelay = 0.05 -- [[ MODIFIED: Faster flashing border ]]
 local globalButtonFeedbackDuration = 2
 local minInjectionRate = 2
 local maxInjectionRate = 98
 local injectionRateStep = 2
 local matrixRateThreshold = 0.001
 local scanForNewDevicesInterval = 5
+
+-- Fission Reactor Safety
+local fissionCriticalTemp = 1800 -- Temp (K) to trigger automatic SCRAM. Meltdown is at 2000K.
+local fissionCriticalDamage = 90 -- Damage % to trigger automatic SCRAM.
+local fissionScramResetTempK = 300 -- [[ NEW: Auto-reset alerts below 80°F / 300K ]]
 
 local dumpingModes = {
     { apiName = "IDLE", displayName = "Idle" },
@@ -70,13 +80,14 @@ local dynamicColorThresholds = {
         dtFuel = { yellow = 39.8e6, orange = 59.7e6, red = 71.6e6 }
     },
     boilerTemp = { yellow = 400, orange = 600, red = 1000 },
-    thermalTemp = { yellow = 320, orange = 350, red = 400 }
+    thermalTemp = { yellow = 320, orange = 350, red = 400 },
+    fissionTemp = { yellow = 1000, orange = 1500, red = 1800 }
 }
 
 -- =================================================================
 -- Global State and Initialization
 -- =================================================================
-local monitor = peripheral.find("monitor")
+local monitors = {}
 
 -- State management for asymmetric display
 local sharedData = {
@@ -87,18 +98,23 @@ local sharedData = {
     lastError = {},
     currentPageTerm = 1,
     totalPagesTerm = 1,
-    currentPageMon = 1,
+    monitorStates = {},
     totalPagesMon = 1,
     pageButtonRegions = {},
     foundDevices = {},
     drawableItems = {},
     pagedItemsMon = {},
+    actionQueue = {}, -- Queue for reactor adjustments
+    scrammingReactors = {}, -- Tracks which fission reactors are in SCRAM state
+    speaker = nil, -- Holds the speaker peripheral, if found
+    flashToggle = true, -- Used for flashing visual alerts
+    sirenBuffers = {}, -- Holds pre-generated audio data for the siren
     overallTurbineStats = { energyStored = 0, maxEnergy = 0, energyFilledPercentage = 0, productionRate = 0, maxProduction = 0, steamAmount = 0, steamCapacity = 0, steamFilledPercentage = 0, formedCount = 0, totalTurbineCount = 0 },
     globalModeButtonFeedback = { modeAPIName = nil, colorKey = nil, expiryTime = 0 },
     globallyConsistentTurbineMode = nil,
     config = {
         tempUnit = "K",
-        deviceOrder = { "sps", "fusionReactor", "inductionMatrix", "dynamicTank", "thermalEvaporation", "boiler", "turbine", "turbineSummary" },
+        deviceOrder = { "sps", "fusionReactor", "fissionReactor", "inductionMatrix", "dynamicTank", "thermalEvaporation", "boiler", "turbine", "turbineSummary" },
         useColoredBorders = true
     },
     needsRedraw = true
@@ -224,6 +240,7 @@ local function getBorderColors(deviceType)
     local colorMap = {
         turbine = { border = "gray", text = "orange" },
         fusionReactor = { border = "brown", text = "white" },
+        fissionReactor = { border = "green", text = "black" },
         inductionMatrix = { border = "cyan", text = "black" },
         boiler = { border = "orange", text = "black" },
         thermalEvaporation = { border = "lightBlue", text = "black" },
@@ -251,66 +268,77 @@ local function calculateMonitorPages()
     end
 
     local pages = {}
-    local itemIndex = 1
-    
-    while itemIndex <= #allItems do
+    local placedStatus = {} -- Keep track of which items (by index) have been placed
+
+    while countKeys(placedStatus) < #allItems do
         local currentPageItems = {}
-        local slotsOnPage = {}
-        local slotsUsed = 0
-
-        while itemIndex <= #allItems and slotsUsed < devicesPerPageMonitor do
-            local currentItem = allItems[itemIndex]
-            local isDouble = false
-            
-            if currentItem.drawType == "device" and currentItem.info.type == "fusionReactor" then
-                local stats = sharedData.deviceStats[currentItem.info.name]
-                if stats and (stats.waterAmount or 0) > 0 and (stats.steamAmount or 0) > 0 and stats.fuel and not stats.fuel.hasDTFuel then
-                    isDouble = true
+        local slotsOnPage = {} -- { [1]=true, ... }
+        
+        -- Pass 1: Place Double-Height Items
+        for i = 1, #allItems do
+            if not placedStatus[i] then -- Only consider unplaced items
+                local item = allItems[i]
+                local isDouble = false
+                if item.drawType == "device" then
+                    if item.info.type == "fissionReactor" then 
+                        isDouble = true
+                    elseif item.info.type == "fusionReactor" then
+                        local stats = sharedData.deviceStats[item.info.name]
+                        if stats and stats.fuel and (stats.waterAmount or 0) > 0 and (stats.steamAmount or 0) > 0 and not stats.fuel.hasDTFuel then 
+                            isDouble = true 
+                        end
+                    end
                 end
-            end
-            
-            local placed = false
-            if isDouble then
-                if not slotsOnPage[1] and not slotsOnPage[3] then
-                    table.insert(currentPageItems, {item=currentItem, layout={gridX=1, gridY=1, gridW=1, gridH=2}})
-                    slotsOnPage[1] = true; slotsOnPage[3] = true
-                    slotsUsed = slotsUsed + 2
-                    placed = true
-                elseif not slotsOnPage[2] and not slotsOnPage[4] then
-                    table.insert(currentPageItems, {item=currentItem, layout={gridX=2, gridY=1, gridW=1, gridH=2}})
-                    slotsOnPage[2] = true; slotsOnPage[4] = true
-                    slotsUsed = slotsUsed + 2
-                    placed = true
-                end
-            end
-
-            if not placed then
-                for i=1, 4 do
-                    if not slotsOnPage[i] then
-                        local gridX = (i % 2 == 1) and 1 or 2
-                        local gridY = (i <= 2) and 1 or 2
-                        table.insert(currentPageItems, {item=currentItem, layout={gridX=gridX, gridY=gridY, gridW=1, gridH=1}})
-                        slotsOnPage[i] = true
-                        slotsUsed = slotsUsed + 1
-                        placed = true
-                        break
+                
+                if isDouble then
+                    if countKeys(slotsOnPage) <= (devicesPerPageMonitor - 2) then
+                        -- Check if there's a free column
+                        if not slotsOnPage[1] and not slotsOnPage[3] then
+                            table.insert(currentPageItems, {item=item, layout={gridX=1, gridY=1, gridW=1, gridH=2}})
+                            slotsOnPage[1] = true; slotsOnPage[3] = true
+                            placedStatus[i] = true
+                        elseif not slotsOnPage[2] and not slotsOnPage[4] then
+                             table.insert(currentPageItems, {item=item, layout={gridX=2, gridY=1, gridW=1, gridH=2}})
+                            slotsOnPage[2] = true; slotsOnPage[4] = true
+                            placedStatus[i] = true
+                        end
                     end
                 end
             end
-            
-            if placed then
-                itemIndex = itemIndex + 1
-            else
-                break -- Can't fit this item, move to next page
+        end
+
+        -- Pass 2: Place Single-Height Items
+        for i = 1, #allItems do
+            if not placedStatus[i] then -- Only consider unplaced items
+                if countKeys(slotsOnPage) < devicesPerPageMonitor then
+                    -- Find first available single slot
+                    for slot_idx=1, devicesPerPageMonitor do
+                        if not slotsOnPage[slot_idx] then
+                            local gridX = (slot_idx % 2 == 1) and 1 or 2
+                            local gridY = (slot_idx <= 2) and 1 or 2
+                            table.insert(currentPageItems, {item=allItems[i], layout={gridX=gridX, gridY=gridY, gridW=1, gridH=1}})
+                            slotsOnPage[slot_idx] = true
+                            placedStatus[i] = true
+                            break -- Item placed, move to next item
+                        end
+                    end
+                else
+                    break -- Page is full
+                end
             end
         end
+
         table.insert(pages, currentPageItems)
+        
+        if countKeys(placedStatus) == #allItems then break end
     end
     
     sharedData.pagedItemsMon = pages
     sharedData.totalPagesMon = math.max(1, #pages)
-    if sharedData.currentPageMon > sharedData.totalPagesMon then
-        sharedData.currentPageMon = sharedData.totalPagesMon
+    for _, state in pairs(sharedData.monitorStates) do
+        if state.currentPage > sharedData.totalPagesMon then
+            state.currentPage = sharedData.totalPagesMon
+        end
     end
 end
 
@@ -332,7 +360,7 @@ local function reinitializeLayout()
         table.sort(devices, function(a, b) return a.name < b.name end)
     end
 
-    local typeCounters = { turbine = 0, fusionReactor = 0, inductionMatrix = 0, boiler = 0, thermalEvaporation = 0, dynamicTank = 0, sps = 0 }
+    local typeCounters = { turbine = 0, fusionReactor = 0, fissionReactor = 0, inductionMatrix = 0, boiler = 0, thermalEvaporation = 0, dynamicTank = 0, sps = 0 }
 
     for _, itemType in ipairs(sharedData.config.deviceOrder) do
         if itemType == "turbineSummary" then
@@ -351,7 +379,7 @@ local function reinitializeLayout()
     end
 
     sharedData.drawableItems = allDrawableItems
-    calculateMonitorPages()
+    -- The page calculation is now done in the display task to prevent race conditions.
     sharedData.totalPagesTerm = math.max(1, math.ceil(#sharedData.drawableItems / devicesPerPageTerminal))
     if sharedData.currentPageTerm > sharedData.totalPagesTerm then sharedData.currentPageTerm = sharedData.totalPagesTerm end
     debugPrint("Layout reinitialized. Items: " .. #sharedData.drawableItems)
@@ -431,7 +459,8 @@ local function drawTurbineInQuadrant(window, targetName, devInfo,sts,lE,qx,qy,qW
         window.setTextColor(colors.green);window.setCursorPos(iX,cY);window.write("Energy:");window.setTextColor(colors.white);window.setCursorPos(iX+8,cY);window.write(("%s/%s FE/t"):format(formatNumber(sts.productionRate),formatNumber(sts.maxProduction)):sub(1,cW-8));cY=cY+2
         window.setTextColor(colors.yellow);window.setCursorPos(iX,cY);local sT=(sts.width and string.format("%dx%dx%d",sts.width,sts.length,sts.height))or"N/A";window.write(("Size: %s"):format(sT):sub(1,cW));cY=cY+1
         
-        local bY=qy+qH-2;if bY>=cY then local bE={};local totBW=0;for _,mI in ipairs(dumpingModes)do local iA=sts.dumpingMode==mI.apiName;local iGSL=sharedData.globalModeButtonFeedback.modeAPIName==mI.apiName and sharedData.globalModeButtonFeedback.expiryTime>os.time();local bT=iA and("["..mI.displayName.."]")or(iGSL and("["..mI.displayName.."]")or(" "..mI.displayName.." "));table.insert(bE,{text=bT,mode=mI,active=iA,globallySetLime=iGSL});totBW=totBW+#bT end;totBW=totBW+#dumpingModes-1;local bSX=iX+math.max(0,math.floor((cW-totBW)/2));local cBX=bSX;for _,bEl in ipairs(bE)do local cK=bEl.active and"yellow"or(bEl.globallySetLime and"lime"or"white");window.setTextColor(getSafeColor(cK));if cBX+#bEl.text-1<qx+qW-1 then window.setCursorPos(cBX,bY);window.write(bEl.text);table.insert(sharedData.pageButtonRegions,{type="dump_mode",target=targetName,turbineName=devInfo.name,modeToSet=bEl.mode.apiName,xStart=cBX,xEnd=cBX+#bEl.text-1,pageY=bY});cBX=cBX+#bEl.text+1 else break end end end
+        local buttonY=qy+qH-2
+        local bE={};local totBW=0;for _,mI in ipairs(dumpingModes)do local iA=sts.dumpingMode==mI.apiName;local iGSL=sharedData.globalModeButtonFeedback.modeAPIName==mI.apiName and sharedData.globalModeButtonFeedback.expiryTime>os.time();local bT=iA and("["..mI.displayName.."]")or(iGSL and("["..mI.displayName.."]")or(" "..mI.displayName.." "));table.insert(bE,{text=bT,mode=mI,active=iA,globallySetLime=iGSL});totBW=totBW+#bT end;totBW=totBW+#dumpingModes-1;local bSX=iX+math.max(0,math.floor((cW-totBW)/2));local cBX=bSX;for _,bEl in ipairs(bE)do local cK=bEl.active and"yellow"or(bEl.globallySetLime and"lime"or"white");window.setTextColor(getSafeColor(cK));if cBX+#bEl.text-1<qx+qW-1 then window.setCursorPos(cBX,buttonY);window.write(bEl.text);table.insert(sharedData.pageButtonRegions,{type="dump_mode",target=targetName,turbineName=devInfo.name,modeToSet=bEl.mode.apiName,xStart=cBX,xEnd=cBX+#bEl.text-1,pageY=buttonY});cBX=cBX+#bEl.text+1 else break end end
     end)
 end
 
@@ -442,25 +471,31 @@ local function drawFusionReactorQuadrant(window, targetName, devInfo,sts,lE,qx,q
         window.setBackgroundColor(colors.black); local iX, cY, cW, bDTW = qx+2, qy+2, qW-4, qW-4
         if lE then window.setTextColor(colors.red);window.setCursorPos(iX,cY);window.write(("Error: "..lE):sub(1,cW)); return end
         if not sts or not sts.fuel then window.setTextColor(colors.gray);window.setCursorPos(iX,cY);window.write("Waiting..."); return end
+
+        local useSpacedLayout = (qH > 15)
+        local verticalPadding = useSpacedLayout and 2 or 1
         
         local mPX=iX+math.floor(cW/2); local hCW=math.floor(cW/2)-1
+        
         if sts.waterAmount and sts.waterAmount>0 then
             window.setTextColor(colors.blue);window.setCursorPos(iX,cY);window.write("Water:");window.setTextColor(colors.white);window.setCursorPos(iX+7,cY);window.write(("%s/%s (%s)"):format(formatNumber(sts.waterAmount,0),formatNumber(sts.waterCapacity,0),formatPercentage(sts.waterFilledPercentage)):sub(1,cW-7));cY=cY+1
-            drawDetailedProgressBar(window,sts.waterAmount,sts.waterCapacity,bDTW,iX,cY,"blue","gray","("..formatPercentage(sts.waterFilledPercentage)..")");cY=cY+2
+            drawDetailedProgressBar(window,sts.waterAmount,sts.waterCapacity,bDTW,iX,cY,"blue","gray","("..formatPercentage(sts.waterFilledPercentage)..")");cY=cY+verticalPadding
         end
         if sts.steamAmount and sts.steamAmount>0 then
             window.setTextColor(colors.lightGray);window.setCursorPos(iX,cY);window.write("Steam:");window.setTextColor(colors.white);window.setCursorPos(iX+7,cY);window.write(("%s/%s (%s)"):format(formatNumber(sts.steamAmount,0),formatNumber(sts.steamCapacity,0),formatPercentage(sts.steamFilledPercentage)):sub(1,cW-7));cY=cY+1
-            drawDetailedProgressBar(window,sts.steamAmount,sts.steamCapacity,bDTW,iX,cY,"lightGray","gray","("..formatPercentage(sts.steamFilledPercentage)..")");cY=cY+2
+            drawDetailedProgressBar(window,sts.steamAmount,sts.steamCapacity,bDTW,iX,cY,"lightGray","gray","("..formatPercentage(sts.steamFilledPercentage)..")");cY=cY+verticalPadding
         end
+        
         if sts.fuel.hasDTFuel then
             window.setTextColor(colors.purple);window.setCursorPos(iX,cY);window.write("DTFuel:");window.setTextColor(colors.white);window.setCursorPos(iX+8,cY);window.write(("%s/%s (%s)"):format(formatNumber(sts.fuel.dtFuelAmount,0),formatNumber(sts.fuel.dtFuelCapacity,0),formatPercentage(sts.fuel.dtFuelFilledPercentage)):sub(1,cW-8));cY=cY+1
-            drawDetailedProgressBar(window,sts.fuel.dtFuelAmount,sts.fuel.dtFuelCapacity,bDTW,iX,cY,"purple","gray","("..formatPercentage(sts.fuel.dtFuelFilledPercentage)..")");cY=cY+2
+            drawDetailedProgressBar(window,sts.fuel.dtFuelAmount,sts.fuel.dtFuelCapacity,bDTW,iX,cY,"purple","gray","("..formatPercentage(sts.fuel.dtFuelFilledPercentage)..")");cY=cY+verticalPadding
         else
             window.setTextColor(colors.red);window.setCursorPos(iX,cY);window.write("Deuterium:");window.setTextColor(colors.white);window.setCursorPos(iX+11,cY);window.write(("%s/%s"):format(formatNumber(sts.fuel.deuteriumAmount,0),formatNumber(sts.fuel.deuteriumCapacity,0)):sub(1,cW-11));cY=cY+1
-            drawDetailedProgressBar(window,sts.fuel.deuteriumAmount,sts.fuel.deuteriumCapacity,bDTW,iX,cY,"red","gray",formatPercentage(sts.fuel.deuteriumFilledPercentage));cY=cY+2
+            drawDetailedProgressBar(window,sts.fuel.deuteriumAmount,sts.fuel.deuteriumCapacity,bDTW,iX,cY,"red","gray",formatPercentage(sts.fuel.deuteriumFilledPercentage));cY=cY+verticalPadding
             window.setTextColor(colors.green);window.setCursorPos(iX,cY);window.write("Tritium:");window.setTextColor(colors.white);window.setCursorPos(iX+9,cY);window.write(("%s/%s"):format(formatNumber(sts.fuel.tritiumAmount,0),formatNumber(sts.fuel.tritiumCapacity,0)):sub(1,cW-9));cY=cY+1
-            drawDetailedProgressBar(window,sts.fuel.tritiumAmount,sts.fuel.tritiumCapacity,bDTW,iX,cY,"green","gray",formatPercentage(sts.fuel.tritiumFilledPercentage));cY=cY+2
+            drawDetailedProgressBar(window,sts.fuel.tritiumAmount,sts.fuel.tritiumCapacity,bDTW,iX,cY,"green","gray",formatPercentage(sts.fuel.tritiumFilledPercentage));cY=cY+verticalPadding
         end
+        
         local caseTempThresh = sts.fuel.hasDTFuel and dynamicColorThresholds.caseTemp.dtFuel or dynamicColorThresholds.caseTemp.noDt
         local plasmaTempThresh = sts.fuel.hasDTFuel and dynamicColorThresholds.plasmaTemp.dtFuel or dynamicColorThresholds.plasmaTemp.noDt
         local energyThresh = sts.fuel.hasDTFuel and dynamicColorThresholds.energy.dtFuel or dynamicColorThresholds.energy.noDt
@@ -468,48 +503,32 @@ local function drawFusionReactorQuadrant(window, targetName, devInfo,sts,lE,qx,q
         local plasmaTempColor = getDynamicColor(sts.plasmaTemp, plasmaTempThresh)
         local energyColor = getDynamicColor(sts.productionRate, energyThresh)
         
-        local currentY = cY
-        if currentY < qy + qH - 3 then
+        if cY < qy + qH - 2 then
             local caseT, caseU = convertTemperature(sts.caseTemp, sharedData.config.tempUnit)
             local plasmaT, plasmaU = convertTemperature(sts.plasmaTemp, sharedData.config.tempUnit)
             local caseStr = ("Case: %s%s"):format(formatNumber(caseT,1), caseU)
-            window.setTextColor(getSafeColor(caseTempColor)); window.setCursorPos(iX,currentY); window.write(caseStr:sub(1,hCW-1))
+            window.setTextColor(getSafeColor(caseTempColor)); window.setCursorPos(iX,cY); window.write(caseStr:sub(1,hCW-1))
             local plasmaStr = ("Plasma: %s%s"):format(formatNumber(plasmaT,1), plasmaU)
-            window.setTextColor(getSafeColor(plasmaTempColor)); window.setCursorPos(mPX,currentY); window.write(plasmaStr:sub(1,cW-mPX+iX-1))
-            currentY = currentY+1
+            window.setTextColor(getSafeColor(plasmaTempColor)); window.setCursorPos(mPX,cY); window.write(plasmaStr:sub(1,cW-mPX+iX-1))
+            cY = cY+1
         end
-        if currentY < qy + qH - 2 then
+        if cY < qy + qH - 1 then
             local energyStr = ("Energy: %s FE/t"):format(formatNumber(sts.productionRate))
-            window.setTextColor(getSafeColor(energyColor)); window.setCursorPos(iX,currentY); window.write(energyStr:sub(1,hCW-1))
+            window.setTextColor(getSafeColor(energyColor)); window.setCursorPos(iX,cY); window.write(energyStr:sub(1,hCW-1))
             local iC=sts.isIgnited and colors.lime or colors.red; local iT=sts.isIgnited and "Ignited" or "Off"; local sT="Status: "..iT
-            window.setTextColor(iC); window.setCursorPos(mPX+math.max(0,math.floor((hCW-#sT)/2)),currentY); window.write(sT:sub(1,hCW-1))
-            currentY = currentY+1
+            window.setTextColor(iC); window.setCursorPos(mPX+math.max(0,math.floor((hCW-#sT)/2)),cY); window.write(sT:sub(1,hCW-1))
         end
+        
+        -- Override: Always draw buttons at the bottom of the quadrant
+        local buttonY=qy+qH-2 
+        
+        local tempB, tempT = window.getBackgroundColor(), window.getTextColor()
+        window.setBackgroundColor(colors.black)
+        window.setCursorPos(qx + 1, buttonY); window.write(string.rep(" ", qW - 2))
+        window.setBackgroundColor(tempB); window.setTextColor(tempT)
 
-        local buttonY=qy+qH-2
-        if buttonY >= currentY then
-            local btnElements = {
-                {t="[MIN]",a="set_min",c="blue"},
-                {t="[-]",a="dec_rate",c="red"},
-                {t=" "..string.format("%2d",sts.injectionRate or 0).." ",a="display_only",c="white"},
-                {t="[+]",a="inc_rate",c="green"},
-                {t="[MAX]",a="set_max",c="blue"}
-            }
-            local totalButtonsWidth = 0
-            for _,el in ipairs(btnElements) do totalButtonsWidth = totalButtonsWidth + #el.t end
-            totalButtonsWidth = totalButtonsWidth + (#btnElements - 1)
-            local currentButtonX = iX + math.floor((cW - totalButtonsWidth) / 2)
-            
-            for _,btnData in ipairs(btnElements) do
-                window.setTextColor(getSafeColor(btnData.c))
-                window.setCursorPos(currentButtonX, buttonY)
-                window.write(btnData.t)
-                if btnData.a ~= "display_only" then
-                    table.insert(sharedData.pageButtonRegions,{type="set_injection_rate",target=targetName,deviceName=devInfo.name,action=btnData.a,currentRate=sts.injectionRate,xStart=currentButtonX,xEnd=currentButtonX+#btnData.t-1,pageY=buttonY})
-                end
-                currentButtonX = currentButtonX + #btnData.t + 1
-            end
-        end
+        -- [[ FIX: Changed bEl.text to bEl.t ]]
+        local btnE={};local totBW=0; table.insert(btnE,{t="[MIN]",a="set_min",c="blue"}); table.insert(btnE,{t="[-]",a="dec_rate",c="red"}); table.insert(btnE,{t=" "..string.format("%2d",sts.injectionRate or 0).." ",a="display_only",c="white"}); table.insert(btnE,{t="[+]",a="inc_rate",c="green"}); table.insert(btnE,{t="[MAX]",a="set_max",c="blue"}); for _,el in ipairs(btnE)do totBW=totBW+#el.t end;totBW = totBW + #btnE - 1; local bSX=iX+math.max(0,math.floor((cW-totBW)/2));local cBX=bSX; for _,bEl in ipairs(btnE)do window.setTextColor(getSafeColor(bEl.c)); if cBX+#bEl.t-1<qx+qW-1 then window.setCursorPos(cBX,buttonY);window.write(bEl.t); if bEl.a~="display_only"then table.insert(sharedData.pageButtonRegions,{type="set_injection_rate",target=targetName,deviceName=devInfo.name,action=bEl.a,currentRate=sts.injectionRate,xStart=cBX,xEnd=cBX+#bEl.t-1,pageY=buttonY})end; cBX=cBX+#bEl.t+1 else break end end
     end)
 end
 
@@ -529,7 +548,7 @@ local function drawInductionMatrixQuadrant(window, targetName, devInfo,sts,lE,qx
         drawDetailedProgressBar(window, sts.energyFE,sts.maxEnergyFE,bDTW,iX,cY,"green","gray", formatPercentage(sts.energyFilledPercentage)); cY=cY+2
         
         local rt=sts.energyChangeRatePerTick or 0;local rtP, rtCK;
-        if rt>matrixRateThreshold then rtP="Input: ";rtCK="green" elseif rt<-matrixRateThreshold then rtP="Output: ";rtCK="red" else rtP="Net:    ";rt=0;rtCK="gray" end
+        if rt>matrixRateThreshold then rtP="Input: ";rtCK="green" elseif rt<-matrixRateThreshold then rtP="Output: ";rtCK="red" else rtP="Net:       ";rt=0;rtCK="gray" end
         local rateDisplay = (rtP .. formatLargeEnergyFE(rt) .. "FE/t")
         
         local tES="N/A";local tEL="Status: ";local timeColorKey="gray";
@@ -548,7 +567,7 @@ local function drawInductionMatrixQuadrant(window, targetName, devInfo,sts,lE,qx
         local cellsStr = ("Cells: " .. tostring(sts.installedCells or "N/A")); local providersStr = ("Prov: " .. tostring(sts.installedProviders or "N/A"))
         local dS= sts.isFormed and (sts.width.."x"..sts.height.."x"..sts.length) or "N/A"
         local sizeStr = ("Size: " .. dS)
-        local combinedStatsStr = cellsStr .. "  " .. providersStr .. "  " .. sizeStr
+        local combinedStatsStr = cellsStr .. "   " .. providersStr .. "   " .. sizeStr
         local statsStartX = iX + math.max(0, math.floor((cW - #combinedStatsStr) / 2))
         window.setTextColor(colors.white);
         window.setCursorPos(statsStartX, cY); window.write(cellsStr)
@@ -657,11 +676,9 @@ local function drawSPSQuadrant(window, targetName, devInfo,sts,lE,qx,qy,qW,qH)
     pcall(function()
         local title="SPS "..(devInfo.typeId or "N/A"); local borderColors = getBorderColors("sps")
         drawQuadrantBorder(window, qx,qy,qW,qH,borderColors.border,title,borderColors.text)
-        window.setBackgroundColor(colors.black); local iX, cY, cW, bDTW = qx+2, qy+2, qW-4, qW-4
+        window.setBackgroundColor(colors.black); local iX, cY, cW, bDTW = qx+2, qy+3, qW-4, qW-4
         if lE then window.setTextColor(colors.red);window.setCursorPos(iX,cY);window.write(("Error: "..lE):sub(1,cW)); return end
         if not sts then window.setTextColor(colors.gray);window.setCursorPos(iX,cY);window.write("Waiting..."); return end
-
-        cY = cY + 1 -- Move content up
 
         -- Input
         window.setTextColor(colors.cyan); window.setCursorPos(iX,cY); window.write("Polonium:"); window.setTextColor(colors.white); window.setCursorPos(iX+10,cY); window.write(("%s/%s"):format(formatNumber(sts.input.amount,0),formatNumber(sts.inputCapacity,0)):sub(1,cW-10)); cY=cY+1
@@ -709,6 +726,98 @@ local function drawSPSQuadrant(window, targetName, devInfo,sts,lE,qx,qy,qW,qH)
                 pageY=bY
             })
         end
+    end)
+end
+
+local function drawFissionReactorQuadrant(window, targetName, devInfo,sts,lE,qx,qy,qW,qH)
+    pcall(function()
+        local isScrammed = sharedData.scrammingReactors[devInfo.name]
+        local borderColors = getBorderColors("fissionReactor")
+        
+        local currentBorderColor = borderColors.border
+        if isScrammed and sharedData.flashToggle then
+            currentBorderColor = "red"
+        end
+
+        local title="Fission Reactor "..(devInfo.typeId or "N/A");
+        drawQuadrantBorder(window, qx,qy,qW,qH,currentBorderColor,title,borderColors.text)
+
+        window.setBackgroundColor(colors.black); local iX, cY, cW, bDTW = qx+2, qy+2, qW-4, qW-4
+        if lE then window.setTextColor(colors.red);window.setCursorPos(iX,cY);window.write(("Error: "..lE):sub(1,cW)); return end
+        if not sts then window.setTextColor(colors.gray);window.setCursorPos(iX,cY);window.write("Waiting..."); return end
+
+        local tempColor = getDynamicColor(sts.temperature, dynamicColorThresholds.fissionTemp)
+        local tempVal, tempUnit = convertTemperature(sts.temperature, sharedData.config.tempUnit)
+        local tempStr = ("Temp: "..formatNumber(tempVal, 1)..tempUnit)
+        window.setTextColor(getSafeColor(tempColor)); window.setCursorPos(iX, cY); window.write(tempStr:sub(1, math.floor(cW/2)));
+
+        local damageColor = sts.damagePercent > 50 and colors.red or (sts.damagePercent > 25 and colors.orange or colors.yellow)
+        local damageStr = ("Dmg: %.1f%%"):format(sts.damagePercent or 0)
+        window.setTextColor(damageColor); window.setCursorPos(iX + cW - #damageStr, cY); window.write(damageStr); cY=cY+1
+
+        local statusColor = colors.white
+        if sts.status == "ACTIVE" then statusColor = colors.lime
+        elseif sts.status == "IDLE" then statusColor = colors.yellow
+        elseif sts.status == "SCRAM" or sts.status == "DAMAGED" or sts.status == "MELTDOWN" then
+            statusColor = sharedData.flashToggle and colors.red or colors.white
+        end
+        local statusText = "Status: " .. (sts.status or "N/A")
+        window.setTextColor(statusColor); window.setCursorPos(iX, cY); window.write(statusText); cY=cY+2
+
+        window.setTextColor(colors.white); window.setCursorPos(iX, cY); window.write(("Heat: %sK/%sK"):format(formatNumber(sts.heatingRate or 0), formatNumber(sts.heatCapacity or 1))); cY=cY+1
+        drawDetailedProgressBar(window, sts.heatingRate or 0, sts.heatCapacity or 1, bDTW, iX, cY, "red", "gray", formatPercentage((sts.heatingRate or 0) / (sts.heatCapacity or 1))); cY=cY+2
+
+        window.setTextColor(colors.yellow); window.setCursorPos(iX, cY); window.write("Fuel:"); window.setTextColor(colors.white); window.write(("%s/%s"):format(formatNumber((sts.fuel and sts.fuel.amount) or 0, 1), formatNumber(sts.fuelCapacity or 1, 1))); cY=cY+1
+        drawDetailedProgressBar(window, (sts.fuel and sts.fuel.amount) or 0, sts.fuelCapacity or 1, bDTW, iX, cY, "yellow", "gray", formatPercentage(sts.fuelFilledPercentage or 0)); cY=cY+2
+
+        window.setTextColor(colors.blue); window.setCursorPos(iX, cY); window.write("Coolant:"); window.setTextColor(colors.white); window.write(("%s/%s"):format(formatNumber((sts.coolant and sts.coolant.amount) or 0, 1), formatNumber(sts.coolantCapacity or 1, 1))); cY=cY+1
+        drawDetailedProgressBar(window, (sts.coolant and sts.coolant.amount) or 0, sts.coolantCapacity or 1, bDTW, iX, cY, "blue", "gray", formatPercentage(sts.coolantFilledPercentage or 0)); cY=cY+2
+        
+        window.setTextColor(colors.red); window.setCursorPos(iX, cY); window.write("Waste:"); window.setTextColor(colors.white); window.write(("%s/%s"):format(formatNumber((sts.waste and sts.waste.amount) or 0, 1), formatNumber(sts.wasteCapacity or 1, 1))); cY=cY+1
+        drawDetailedProgressBar(window, (sts.waste and sts.waste.amount) or 0, sts.wasteCapacity or 1, bDTW, iX, cY, "red", "gray", formatPercentage(sts.wasteFilledPercentage or 0)); cY=cY+2
+        
+        local burnRateStr = ("Burn Rate: %.1f mB/t (Set: %.1f)"):format(sts.actualBurnRate or 0, sts.burnRate or 0)
+        window.setTextColor(colors.white); window.setCursorPos(iX + math.floor((cW - #burnRateStr)/2), cY); window.write(burnRateStr); cY=cY+2
+        
+        -- Override: Always draw buttons at the bottom
+        local buttonY_1 = qy+qH-3
+        local buttonY_2 = qy+qH-2
+
+        local tempB, tempT = window.getBackgroundColor(), window.getTextColor()
+        window.setBackgroundColor(colors.black)
+        window.setCursorPos(qx + 1, buttonY_1); window.write(string.rep(" ", qW - 2))
+        window.setCursorPos(qx + 1, buttonY_2); window.write(string.rep(" ", qW - 2))
+        window.setBackgroundColor(tempB); window.setTextColor(tempT)
+
+        -- Draw first row of buttons (Activate/SCRAM)
+        local actionButtons = { {t="[ACTIVATE]",a="activate",c="lime"}, {t="[SCRAM]",a="scram",c="red"} }
+        local totalActionWidth = 0
+        for _,el in ipairs(actionButtons) do totalActionWidth = totalActionWidth + #el.t + 1 end
+        totalActionWidth = totalActionWidth - 1
+        local currentButtonX = iX + math.floor((cW - totalActionWidth) / 2)
+        for _,btnData in ipairs(actionButtons) do
+            if btnData.a == "scram" then window.setBackgroundColor(colors.red); window.setTextColor(colors.white)
+            else window.setBackgroundColor(colors.black); window.setTextColor(getSafeColor(btnData.c)) end
+            window.setCursorPos(currentButtonX, buttonY_1); window.write(btnData.t)
+            table.insert(sharedData.pageButtonRegions,{type="fission_control",target=targetName,deviceName=devInfo.name,action=btnData.a,currentRate=sts.burnRate,xStart=currentButtonX,xEnd=currentButtonX+#btnData.t-1,pageY=buttonY_1})
+            currentButtonX = currentButtonX + #btnData.t + 1
+        end
+        
+        -- Draw second row of buttons (Burn Rate)
+        local btnElements = { {t="[<<<]",a="dec_rate_5",c="darkRed"}, {t="[<<]",a="dec_rate_1",c="red"}, {t="[<]",a="dec_rate_01",c="orange"}, {t="[>]",a="inc_rate_01",c="lime"}, {t="[>>]",a="inc_rate_1",c="green"}, {t="[>>>]",a="inc_rate_5",c="darkGreen"} }
+        local totalButtonsWidth = 0
+        for _,el in ipairs(btnElements) do totalButtonsWidth = totalButtonsWidth + #el.t + 1 end
+        totalButtonsWidth = totalButtonsWidth -1
+        currentButtonX = iX + math.floor((cW - totalButtonsWidth) / 2)
+
+        for _,btnData in ipairs(btnElements) do
+            window.setBackgroundColor(colors.black); window.setTextColor(getSafeColor(btnData.c))
+            window.setCursorPos(currentButtonX, buttonY_2); window.write(btnData.t)
+            table.insert(sharedData.pageButtonRegions,{type="fission_control",target=targetName,deviceName=devInfo.name,action=btnData.a,currentRate=sts.burnRate,xStart=currentButtonX,xEnd=currentButtonX+#btnData.t-1,pageY=buttonY_2})
+            currentButtonX = currentButtonX + #btnData.t + 1
+        end
+
+        window.setBackgroundColor(colors.black) -- Reset background color at the end
     end)
 end
 
@@ -760,6 +869,8 @@ local function drawDeviceQuadrant(window, targetName, itemToDraw, qx, qy, qW, qH
             drawDynamicTankQuadrant(window, targetName, devInfo, stats, err, qx, qy, qW, qH)
         elseif devInfo.type == "sps" then
             drawSPSQuadrant(window, targetName, devInfo, stats, err, qx, qy, qW, qH)
+        elseif devInfo.type == "fissionReactor" then
+            drawFissionReactorQuadrant(window, targetName, devInfo, stats, err, qx, qy, qW, qH)
         else
             local title = devInfo.type .. " " .. (devInfo.typeId or "")
             local bC = getBorderColors(devInfo.type)
@@ -772,18 +883,16 @@ local function drawScreen(window, targetName, itemsPerPage, currentPage, totalPa
     local w, h = window.getSize()
     window.setCursorBlink(false); window.setBackgroundColor(colors.black); window.clear()
     
-    local isMonitor = (window == monitor)
+    local isMonitor = (window ~= term)
     
     if #sharedData.drawableItems == 0 then
         if pcall(window.setTextScale, 1) then end
         local msg = "Scanning for Mekanism Devices..."; window.setCursorPos(math.floor((w - #msg)/2) + 1, math.floor(h/2)); window.setTextColor(colors.yellow); window.write(msg)
     else
         local itemsToDraw = {}
-        local startIndex = (currentPage - 1) * itemsPerPage + 1
-        for i = 0, itemsPerPage - 1 do
-            if isMonitor then
-                -- handled by pagedItemsMon
-            else
+        if not isMonitor then
+             local startIndex = (currentPage - 1) * itemsPerPage + 1
+            for i = 0, itemsPerPage - 1 do
                 if startIndex + i <= #sharedData.drawableItems then
                     table.insert(itemsToDraw, sharedData.drawableItems[startIndex + i])
                 end
@@ -791,7 +900,7 @@ local function drawScreen(window, targetName, itemsPerPage, currentPage, totalPa
         end
 
         if isMonitor then
-            if #sharedData.foundDevices > 1 then
+            if #sharedData.drawableItems > 1 then
                 pcall(function() window.setTextScale(0.5) end)
             else
                 pcall(function() window.setTextScale(1) end)
@@ -1001,6 +1110,51 @@ local function fetchSingleDeviceData(devInfo)
             end
             return stats
         end)
+    elseif devType == "fissionReactor" then
+        s,d=pcall(function()
+            local stats = {}
+            stats.isFormed = devP.isFormed()
+            if stats.isFormed then
+                stats.temperature = tonumber(devP.getTemperature()) or 0
+                stats.damagePercent = tonumber(devP.getDamagePercent()) or 0
+                stats.burnRate = tonumber(devP.getBurnRate()) or 0
+                stats.actualBurnRate = tonumber(devP.getActualBurnRate()) or 0
+                stats.fuel = devP.getFuel() or {amount = 0}
+                stats.fuelCapacity = tonumber(devP.getFuelCapacity()) or 1
+                stats.fuelFilledPercentage = tonumber(devP.getFuelFilledPercentage()) or 0
+                stats.coolant = devP.getCoolant() or {amount = 0}
+                stats.coolantCapacity = tonumber(devP.getCoolantCapacity()) or 1
+                stats.coolantFilledPercentage = tonumber(devP.getCoolantFilledPercentage()) or 0
+                stats.heatedCoolant = devP.getHeatedCoolant() or {amount = 0}
+                stats.heatedCoolantCapacity = tonumber(devP.getHeatedCoolantCapacity()) or 1
+                stats.heatedCoolantFilledPercentage = tonumber(devP.getHeatedCoolantFilledPercentage()) or 0
+                stats.waste = devP.getWaste() or {amount = 0}
+                stats.wasteCapacity = tonumber(devP.getWasteCapacity()) or 1
+                stats.wasteFilledPercentage = tonumber(devP.getWasteFilledPercentage()) or 0
+                stats.heatCapacity = tonumber(devP.getHeatCapacity()) or 1
+                stats.heatingRate = tonumber(devP.getHeatingRate()) or 0
+
+                -- [[ NEW RELIABLE STATUS LOGIC ]]
+                -- Derive status from more reliable data points instead of the potentially buggy getStatus()
+                if sharedData.scrammingReactors[devInfo.name] then
+                    stats.status = "SCRAM"
+                elseif stats.damagePercent >= 100 then
+                    stats.status = "MELTDOWN"
+                elseif stats.actualBurnRate > 0 then
+                    stats.status = "ACTIVE"
+                else
+                    stats.status = "IDLE"
+                end
+                
+            else
+                stats.temperature = 0; stats.damagePercent = 0; stats.burnRate = 0; stats.actualBurnRate = 0;
+                stats.fuel = {amount = 0}; stats.fuelCapacity = 1; stats.fuelFilledPercentage = 0;
+                stats.coolant = {amount = 0}; stats.coolantCapacity = 1; stats.coolantFilledPercentage = 0;
+                stats.waste = {amount = 0}; stats.wasteCapacity = 1; stats.wasteFilledPercentage = 0;
+                stats.status = "UNFORMED"; stats.heatCapacity = 1; stats.heatingRate = 0;
+            end
+            return stats
+        end)
     end
     if s then sharedData.deviceStats[devInfo.name]=d; sharedData.lastError[devInfo.name]=nil else sharedData.lastError[devInfo.name]="Fetch Error"; debugPrint("[ERROR] Fetching "..devInfo.name..": "..tostring(d)) end
 end
@@ -1015,6 +1169,29 @@ local function fetchTask()
             parallel.waitForAll(unpack(fetchFunctions))
         end
         
+        -- Process Fission Reactor states after fetching
+        for devName, isScrammed in pairs(table.copy(sharedData.scrammingReactors)) do
+            if isScrammed then
+                local stats = sharedData.deviceStats[devName]
+                -- [[ NEW: Automatically reset SCRAM state if temp is low ]]
+                if stats and stats.temperature < fissionScramResetTempK then
+                    sharedData.scrammingReactors[devName] = nil
+                end
+            end
+
+            local stats = sharedData.deviceStats[devName]
+            if stats and (stats.temperature > fissionCriticalTemp or stats.damagePercent > fissionCriticalDamage) and not sharedData.scrammingReactors[devName] then
+                local dev = peripheral.wrap(devName)
+                if dev then
+                    pcall(dev.scram)
+                    sharedData.scrammingReactors[devName] = true 
+                    term.setCursorPos(1,1); term.clearLine(); term.setTextColor(colors.red)
+                    print("[CRITICAL] Fission Reactor "..devName.." auto-scrammed!")
+                    term.setTextColor(colors.white)
+                end
+            end
+        end
+
         local T={energyStored=0,maxEnergy=0,productionRate=0,maxProduction=0,steamAmount=0,steamCapacity=0,formedCount=0,totalTurbineCount=0};local fTM=nil;local aTMS=true;local tFFMC=false
         for _,dI in ipairs(sharedData.foundDevices)do local S=sharedData.deviceStats[dI.name];if S and dI.type=="turbine"then T.totalTurbineCount=T.totalTurbineCount+1;T.energyStored=T.energyStored+(S.energyStored or 0);T.maxEnergy=T.maxEnergy+(S.maxEnergy or 0);T.productionRate=T.productionRate+(S.productionRate or 0);T.maxProduction=T.maxProduction+(S.maxProduction or 0);T.steamAmount=T.steamAmount+(S.steamAmount or 0);T.steamCapacity=T.steamCapacity+(S.steamCapacity or 0);if S.isFormed then T.formedCount=T.formedCount+1 end;if not tFFMC then fTM=S.dumpingMode;tFFMC=true elseif aTMS and S.dumpingMode~=fTM then aTMS=false end elseif not S and dI.type=="turbine"then aTMS=false end end;if T.totalTurbineCount==0 then aTMS=false end;if aTMS and fTM~=nil then sharedData.globallyConsistentTurbineMode=fTM else sharedData.globallyConsistentTurbineMode=nil end;if T.maxEnergy>0 then T.energyFilledPercentage=T.energyStored/T.maxEnergy else T.energyFilledPercentage=0 end;if T.steamCapacity>0 then T.steamFilledPercentage=T.steamAmount/T.steamCapacity else T.steamFilledPercentage=0 end;sharedData.overallTurbineStats=T
 
@@ -1024,18 +1201,23 @@ local function fetchTask()
 end
 
 local function displayTask()
-    local windows = { term = term }
-    if monitor and pcall(monitor.isColor) then windows.monitor = monitor end
+    local allWindows = { term = term }
+    for _, mon in ipairs(monitors) do
+        allWindows[peripheral.getName(mon)] = mon
+    end
 
     while sharedData.monitorRunning do
         if sharedData.needsRedraw and not sharedData.isMenuOpen then
-            calculateMonitorPages() -- Recalculate pages before drawing
+            -- Recalculate layout here to use the latest data and prevent race conditions
+            calculateMonitorPages()
+
+            sharedData.flashToggle = not sharedData.flashToggle -- Toggle for flashing effects
             sharedData.pageButtonRegions = {} 
-            for targetName, window in pairs(windows) do
+            for targetName, window in pairs(allWindows) do
                 if window then
-                    local isMonitor = (targetName == "monitor")
+                    local isMonitor = (window ~= term)
                     local itemsPerPage = isMonitor and devicesPerPageMonitor or devicesPerPageTerminal
-                    local currentPage = isMonitor and sharedData.currentPageMon or sharedData.currentPageTerm
+                    local currentPage = isMonitor and sharedData.monitorStates[targetName].currentPage or sharedData.currentPageTerm
                     local totalPages = isMonitor and sharedData.totalPagesMon or sharedData.totalPagesTerm
                     pcall(drawScreen, window, targetName, itemsPerPage, currentPage, totalPages)
                 end
@@ -1113,6 +1295,96 @@ local function runGoToMenu(window, totalPages)
     end
 end
 
+local function actionQueueProcessorTask()
+    while sharedData.monitorRunning do
+        if #sharedData.actionQueue > 0 then
+            local task = table.remove(sharedData.actionQueue, 1)
+            local dev = peripheral.wrap(task.deviceName)
+
+            if dev then
+                if task.type == "fusion_injection" then
+                    local s, cRate = pcall(dev.getInjectionRate)
+                    if s and cRate then
+                        local newRate = cRate
+                        if task.action=="set_min"then newRate=minInjectionRate
+                        elseif task.action=="set_max"then newRate=maxInjectionRate
+                        elseif task.action=="inc_rate"then newRate=math.min(maxInjectionRate,cRate+injectionRateStep)
+                        elseif task.action=="dec_rate"then newRate=math.max(minInjectionRate,cRate-injectionRateStep)
+                        end
+                        if newRate ~= cRate then pcall(dev.setInjectionRate, newRate) end
+                    end
+                elseif task.type == "fission_burn_rate" then
+                    local s, cRate = pcall(dev.getBurnRate)
+                    if s and cRate then
+                         local newRate = cRate
+                         if task.action == "inc_rate_01" then newRate = cRate + 0.1
+                         elseif task.action == "inc_rate_1" then newRate = cRate + 1.0
+                         elseif task.action == "inc_rate_5" then newRate = cRate + 5.0
+                         elseif task.action == "dec_rate_01" then newRate = cRate - 0.1
+                         elseif task.action == "dec_rate_1" then newRate = cRate - 1.0
+                         elseif task.action == "dec_rate_5" then newRate = cRate - 5.0
+                         end
+                         pcall(dev.setBurnRate, newRate)
+                    end
+                end
+                -- Small delay between processing actions to prevent peripheral spam
+                sleep(0.1)
+            end
+        else
+            -- Wait if queue is empty to avoid a busy-wait loop
+            sleep(0.05)
+        end
+    end
+end
+
+-- [[ MODIFIED: Function to generate new siren audio buffers ]]
+local function setupSirenAudio()
+    if not sharedData.speaker then return end
+
+    local function generateWave(frequency, duration, waveType)
+        local rate = 48000
+        local bufferSize = math.floor(rate * duration)
+        local buffer = {}
+        local period = rate / frequency
+        for i = 1, bufferSize do
+            if waveType == "square" then
+                -- Generate a square wave: alternates between max and min amplitude
+                if (i % period) < (period / 2) then
+                    buffer[i] = 127
+                else
+                    buffer[i] = -127
+                end
+            else -- Default to sine wave
+                local t = (i / rate) * 2 * math.pi * frequency
+                buffer[i] = math.floor(math.sin(t) * 127)
+            end
+        end
+        return buffer
+    end
+    
+    local highTone = generateWave(2400, 0.25, "square") -- Very high pitch
+    local lowTone = generateWave(1800, 0.25, "square")  -- High pitch
+
+    sharedData.sirenBuffers.alarm = {}
+    for i=1, #highTone do table.insert(sharedData.sirenBuffers.alarm, highTone[i]) end
+    for i=1, #lowTone do table.insert(sharedData.sirenBuffers.alarm, lowTone[i]) end
+end
+
+-- [[ REWRITTEN: Siren task using a single buffer and reliable timing ]]
+local function sirenTask()
+    while sharedData.monitorRunning do
+        if sharedData.speaker and countKeys(sharedData.scrammingReactors) > 0 and sharedData.sirenBuffers.alarm then
+            sharedData.speaker.playAudio(sharedData.sirenBuffers.alarm)
+            -- The total cycle is the sound duration (0.5s) + the pause (1s)
+            sleep(1.5) 
+        else
+            -- If no siren, sleep longer to reduce CPU usage
+            sleep(0.5)
+        end
+    end
+end
+
+
 local function eventListenerTask()
     while sharedData.monitorRunning do
         local event, p1, p2, p3, p4 = os.pullEvent()
@@ -1120,7 +1392,7 @@ local function eventListenerTask()
             if sharedData.isMenuOpen then goto continue end
             local clickType, clickX, clickY
             if event == "mouse_click" then clickType, clickX, clickY = "term", p2, p3
-            elseif event == "monitor_touch" then clickType, clickX, clickY = "monitor", p2, p3
+            elseif event == "monitor_touch" then clickType, clickX, clickY = p1, p2, p3
             elseif event == "key" and p1 == keys.terminate then sharedData.monitorRunning, sharedData.programRunning = false, false; break
             elseif event == "term_resize" then sharedData.needsRedraw = true
             end
@@ -1132,13 +1404,16 @@ local function eventListenerTask()
                         if region.type == "config" then sharedData.monitorRunning = false; break
                         elseif region.type == "end" then sharedData.monitorRunning, sharedData.programRunning = false, false; break
                         elseif region.type == "dump_mode" then
-                            local dev = peripheral.wrap(region.turbineName); if dev then pcall(dev.setDumpingMode, region.modeToSet) end; break
+                            local dev = peripheral.wrap(region.turbineName); if dev then pcall(dev.setDumpingMode, region.modeToSet) end; sharedData.needsRedraw = true; break
                         elseif region.type == "global_dump_mode" then
-                            for _,dI in ipairs(sharedData.foundDevices) do if dI.type=="turbine" then pcall(dI.peripheral.setDumpingMode, region.modeToSet) end end; break
+                            for _,dI in ipairs(sharedData.foundDevices) do if dI.type=="turbine" then pcall(dI.peripheral.setDumpingMode, region.modeToSet) end end; sharedData.needsRedraw = true; break
                         elseif region.type == "set_injection_rate" then
-                            local dev = peripheral.wrap(region.deviceName); if not dev then break end; local cRate = region.currentRate or 0; local newRate = cRate
-                            if region.action=="set_min"then newRate=minInjectionRate elseif region.action=="set_max"then newRate=maxInjectionRate elseif region.action=="inc_rate"then newRate=math.min(maxInjectionRate,cRate+injectionRateStep) elseif region.action=="dec_rate"then newRate=math.max(minInjectionRate,cRate-injectionRateStep) end
-                            if newRate ~= cRate then pcall(dev.setInjectionRate, newRate) end; break
+                            table.insert(sharedData.actionQueue, {
+                                type = "fusion_injection",
+                                deviceName = region.deviceName,
+                                action = region.action
+                            })
+                            break
                         elseif region.type == "container_edit_mode" then
                             local dev = peripheral.wrap(region.deviceName);
                             if dev then
@@ -1147,27 +1422,59 @@ local function eventListenerTask()
                                 elseif region.action == "dec" then
                                     pcall(dev.decrementContainerEditMode)
                                 end
-                            end
-                            break
+                            end; sharedData.needsRedraw = true; break
                         elseif region.type == "sps_redstone_toggle" then
                             local side = region.side
                             local currentState = redstone.getOutput(side)
                             redstone.setOutput(side, not currentState)
                             sharedData.needsRedraw = true
                             break
+                        elseif region.type == "fission_control" then
+                            if region.action == "scram" or region.action == "activate" then
+                                local dev = peripheral.wrap(region.deviceName)
+                                if dev then
+                                    if region.action == "scram" then
+                                        pcall(dev.scram)
+                                        sharedData.scrammingReactors[region.deviceName] = true
+                                    elseif region.action == "activate" then
+                                        pcall(dev.activate)
+                                        sharedData.scrammingReactors[region.deviceName] = nil
+                                    end
+                                end
+                                sharedData.needsRedraw = true
+                            else
+                                table.insert(sharedData.actionQueue, {
+                                    type = "fission_burn_rate",
+                                    deviceName = region.deviceName,
+                                    action = region.action
+                                })
+                            end
+                            break
                         elseif region.type == "goto" and region.target == "term" then
                             runGoToMenu(term, sharedData.totalPagesTerm)
                             break
                         else -- Page navigation
-                            local isMonitor = (region.target == "monitor")
-                            local currentPage = isMonitor and sharedData.currentPageMon or sharedData.currentPageTerm
-                            local totalPages = isMonitor and sharedData.totalPagesMon or sharedData.totalPagesTerm
+                            local isMonitor = (region.target ~= "term")
+                            local currentPage, totalPages
+                            if isMonitor then
+                                currentPage = sharedData.monitorStates[region.target].currentPage
+                                totalPages = sharedData.totalPagesMon
+                            else
+                                currentPage = sharedData.currentPageTerm
+                                totalPages = sharedData.totalPagesTerm
+                            end
+
                             local newPage = currentPage
                             if region.type == "prev" then newPage = currentPage - 1; if newPage < 1 then newPage = totalPages end
                             elseif region.type == "next" then newPage = currentPage + 1; if newPage > totalPages then newPage = 1 end
                             elseif region.type == "page" then newPage = region.pageNum end
+
                             if newPage ~= currentPage then
-                                if isMonitor then sharedData.currentPageMon = newPage else sharedData.currentPageTerm = newPage end
+                                if isMonitor then
+                                    sharedData.monitorStates[region.target].currentPage = newPage
+                                else
+                                    sharedData.currentPageTerm = newPage
+                                end
                                 sharedData.needsRedraw = true
                             end
                             break
@@ -1229,12 +1536,15 @@ function scanAndApplyChanges()
     local currentDeviceNames = {}; for _, dev in ipairs(sharedData.foundDevices) do currentDeviceNames[dev.name] = true end
     for _, peripheralName in ipairs(peripherals) do
         if not currentDeviceNames[peripheralName] then
-            local deviceType, isValid, p = nil, false, peripheral.wrap(peripheralName)
-            if p then
+            local p = peripheral.wrap(peripheralName)
+            if p and peripheral.getType(p) ~= "monitor" then
+                local deviceType, isValid = nil, false
                 if string.sub(peripheralName, 1, #turbineNamePrefix) == turbineNamePrefix then
                     deviceType = "turbine"; local s,r = pcall(p.isFormed); if (s and r) or skipIsFormedValidation then isValid = true end
                 elseif string.sub(peripheralName, 1, #fusionReactorNamePrefix) == fusionReactorNamePrefix then
                     deviceType = "fusionReactor"; if pcall(p.getWaterCapacity) then isValid = true end
+                elseif string.sub(peripheralName, 1, #fissionReactorNamePrefix) == fissionReactorNamePrefix then
+                    deviceType = "fissionReactor"; if pcall(p.getFuelAssemblies) then isValid = true end
                 elseif string.sub(peripheralName, 1, #inductionMatrixNamePrefix) == inductionMatrixNamePrefix then
                     deviceType = "inductionMatrix"; if pcall(p.getMaxEnergy) then isValid = true end
                 elseif string.sub(peripheralName, 1, #boilerNamePrefix) == boilerNamePrefix then
@@ -1327,9 +1637,9 @@ function runConfigurationMenu()
     local tempConfig = table.copy(sharedData.config)
     local regions = {}
     
-    local function drawConfigUIElements(window, w, h)
+    local function drawConfigUIElements(window, w, h, targetName)
         pcall(function()
-            if window == monitor then
+            if targetName ~= "term" then
                 pcall(function() window.setTextScale(1) end)
             end
             window.setTextColor(colors.white)
@@ -1363,7 +1673,7 @@ function runConfigurationMenu()
                 window.setCursorPos(currentX, tempTitleY + 1)
                 window.setBackgroundColor(isActive and colors.green or colors.gray); window.setTextColor(colors.black)
                 window.write(btnText)
-                table.insert(regions, { type = "temp", unit = unitKey, x1 = currentX, y = tempTitleY + 1, x2 = currentX + #btnText - 1, target = (window == monitor) and "monitor" or "term" })
+                table.insert(regions, { type = "temp", unit = unitKey, x1 = currentX, y = tempTitleY + 1, x2 = currentX + #btnText - 1, target = targetName })
                 currentX = currentX + #btnText + 1
             end
             window.setBackgroundColor(colors.black)
@@ -1378,11 +1688,11 @@ function runConfigurationMenu()
             currentX = borderStartX
             window.setCursorPos(currentX, borderTitleY + 1);
             window.setBackgroundColor(tempConfig.useColoredBorders and colors.green or colors.gray); window.setTextColor(colors.black); window.write(coloredBtnText)
-            table.insert(regions, { type = "border", value = true, x1 = currentX, y = borderTitleY + 1, x2 = currentX + #coloredBtnText - 1, target = (window == monitor) and "monitor" or "term" })
+            table.insert(regions, { type = "border", value = true, x1 = currentX, y = borderTitleY + 1, x2 = currentX + #coloredBtnText - 1, target = targetName })
             currentX = currentX + #coloredBtnText + 1
             window.setCursorPos(currentX, borderTitleY + 1);
             window.setBackgroundColor(not tempConfig.useColoredBorders and colors.green or colors.gray); window.setTextColor(colors.black); window.write(grayBtnText)
-            table.insert(regions, { type = "border", value = false, x1 = currentX, y = borderTitleY + 1, x2 = currentX + #grayBtnText - 1, target = (window == monitor) and "monitor" or "term" })
+            table.insert(regions, { type = "border", value = false, x1 = currentX, y = borderTitleY + 1, x2 = currentX + #grayBtnText - 1, target = targetName })
             window.setBackgroundColor(colors.black)
 
             -- Device Order Section
@@ -1401,23 +1711,23 @@ function runConfigurationMenu()
                 local nameStartX = orderStartX + 4 + math.floor((nameFieldWidth - #deviceName) / 2)
                 
                 window.setCursorPos(upArrowX, yPos); window.setTextColor(i > 1 and colors.white or colors.gray); window.write("[^]")
-                table.insert(regions, { type = "order_up", index = i, x1 = upArrowX, y = yPos, x2 = upArrowX + 2, target = (window == monitor) and "monitor" or "term" })
+                table.insert(regions, { type = "order_up", index = i, x1 = upArrowX, y = yPos, x2 = upArrowX + 2, target = targetName })
                 
                 window.setCursorPos(nameStartX, yPos); window.setTextColor(colors.yellow); window.write(deviceName)
                 
                 window.setCursorPos(downArrowX, yPos); window.setTextColor(i < #tempConfig.deviceOrder and colors.white or colors.gray); window.write("[v]")
-                table.insert(regions, { type = "order_down", index = i, x1 = downArrowX, y = yPos, x2 = downArrowX + 2, target = (window == monitor) and "monitor" or "term" })
+                table.insert(regions, { type = "order_down", index = i, x1 = downArrowX, y = yPos, x2 = downArrowX + 2, target = targetName })
             end
 
             local saveText = " Save & Restart "; local quitText = " Quit without Saving "
             window.setCursorPos(2, h);
             window.setBackgroundColor(colors.green); window.setTextColor(colors.black); window.write(saveText)
-            table.insert(regions, { type = "save", x1 = 2, y = h, x2 = 2 + #saveText - 1, target = (window == monitor) and "monitor" or "term" })
+            table.insert(regions, { type = "save", x1 = 2, y = h, x2 = 2 + #saveText - 1, target = targetName })
             
             local quitX = w - #quitText
             window.setCursorPos(quitX, h);
             window.setBackgroundColor(colors.red); window.setTextColor(colors.black); window.write(quitText)
-            table.insert(regions, { type = "quit", x1 = quitX, y = h, x2 = w, target = (window == monitor) and "monitor" or "term" })
+            table.insert(regions, { type = "quit", x1 = quitX, y = h, x2 = w, target = targetName })
             
             window.setBackgroundColor(colors.black); window.setTextColor(colors.white)
         end)
@@ -1429,23 +1739,23 @@ function runConfigurationMenu()
     while true do
         regions = {}
         
-        term.clear()
-        term.setBackgroundColor(colors.black)
-        local termW, termH = term.getSize()
-        drawConfigUIElements(term, termW, termH)
+        local allWindows = { term = term }
+        for _, mon in ipairs(monitors) do
+            allWindows[peripheral.getName(mon)] = mon
+        end
 
-        if monitor then
-            monitor.clear()
-            monitor.setBackgroundColor(colors.black)
-            local monW, monH = monitor.getSize()
-            drawConfigUIElements(monitor, monW, monH)
+        for name, window in pairs(allWindows) do
+            window.clear()
+            window.setBackgroundColor(colors.black)
+            local w, h = window.getSize()
+            drawConfigUIElements(window, w, h, name)
         end
         
         local event, p1, p2, p3 = os.pullEvent()
         
         local clickType, clickX, clickY
         if event == "mouse_click" then clickType, clickX, clickY = "term", p2, p3
-        elseif event == "monitor_touch" then clickType, clickX, clickY = "monitor", p2, p3
+        elseif event == "monitor_touch" then clickType, clickX, clickY = p1, p2, p3
         elseif event == "key" and p1 == keys.terminate then sharedData.programRunning = false; return end
 
         if clickType then
@@ -1467,10 +1777,22 @@ end
 
 function main()
     term.clear()
-    if not monitor then
-        centeredPrint("Exiting: Monitor not found.", 2)
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "monitor" then
+            table.insert(monitors, peripheral.wrap(name))
+            sharedData.monitorStates[name] = { currentPage = 1 }
+        elseif peripheral.getType(name) == "speaker" then
+            sharedData.speaker = peripheral.wrap(name)
+        end
+    end
+
+    if #monitors == 0 then
+        centeredPrint("Exiting: No monitors found.", 2)
         return
     end
+
+    -- [[ NEW: Pre-generate audio for the siren ]]
+    setupSirenAudio()
 
     -- Ensure redstone output is on by default on script start
     redstone.setOutput(spsRedstoneControlSide, true)
@@ -1485,7 +1807,7 @@ function main()
             deviceTypesFound[dev.type] = true
         end
 
-        local defaultOrder = {"sps", "fusionReactor", "inductionMatrix", "dynamicTank", "thermalEvaporation", "boiler", "turbine"}
+        local defaultOrder = {"sps", "fusionReactor", "fissionReactor", "inductionMatrix", "dynamicTank", "thermalEvaporation", "boiler", "turbine"}
         local finalOrder = {}
 
         local turbineCount = 0; for _, dev in ipairs(sharedData.foundDevices) do if dev.type == "turbine" then turbineCount = turbineCount + 1 end end
@@ -1519,7 +1841,7 @@ function main()
         sharedData.monitorRunning = true
         reinitializeLayout() 
         
-        parallel.waitForAll(displayTask, fetchTask, eventListenerTask, scannerTask)
+        parallel.waitForAll(displayTask, fetchTask, eventListenerTask, scannerTask, actionQueueProcessorTask, sirenTask)
         
         if sharedData.programRunning then
             runConfigurationMenu()
@@ -1527,7 +1849,9 @@ function main()
         end
     end
 
-    pcall(function() if monitor then monitor.setBackgroundColor(colors.black); monitor.setTextColor(colors.white); monitor.clear() end end)
+    for _, mon in ipairs(monitors) do
+        pcall(function() mon.setBackgroundColor(colors.black); mon.setTextColor(colors.white); mon.clear() end)
+    end
     term.setBackgroundColor(colors.black); term.setTextColor(colors.white); term.clear(); term.setCursorPos(1,1);
     centeredPrint("Mekanism Monitor stopped.")
     print() -- FIX: Move cursor to the next line on exit.
